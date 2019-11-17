@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/linkage.h>
+#include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -103,11 +104,12 @@ int scm_table_change_add(struct module *mod, unsigned long origin,
 
 /*
  * scm_find_list_item()
- * Search an entry in the changes list.
+ * Search entrys in the changes list.
  */
 int scm_find_list_item(unsigned long new_ptr, u16 syscall_nr) {
   struct sys_call_table_change *item;
 
+  // find a particular entry
   list_for_each_entry(item, &table_change_list, next) {
     if (item->new_ptr != new_ptr || item->syscall_nr != syscall_nr)
       continue;
@@ -126,14 +128,38 @@ int scm_clean_up_list(unsigned long addr, u16 syscall_nr) {
   struct sys_call_table_change *item;
 
   list_for_each_entry(item, &table_change_list, next) {
-    if (item->syscall_nr == syscall_nr && item->new_ptr != addr)
+    if (item->syscall_nr == syscall_nr && item->new_ptr != addr) {
       printk("Found a list entry for deletion. %lx - %i\n", addr, syscall_nr);
-    list_del(&item->next);
-    kfree(item);
-    return 1;
-  }
 
+      list_del(&item->next);
+      kfree(item);
+      return 1;
+    }
+  }
   return 0;
+}
+
+/*
+ * scm_free_list()
+ *
+ */
+void scm_free_list(void) {
+  struct sys_call_table_change *item;
+  struct list_head *list, *safe;
+
+  if (list_empty(&table_change_list))
+    return;
+
+  list_for_each_safe(list, safe, &table_change_list) {
+    item = list_entry(list, struct sys_call_table_change, next);
+    printk("scm_free_list: Debug1\n");
+
+    list_del(&item->next);
+    printk("scm_free_list: Debug2\n");
+
+    kfree(item);
+    printk("scm_free_list: Debug3\n");
+  }
 }
 
 static inline void scm_read_idt_entry(gate_desc *gate, unsigned int vector,
@@ -199,9 +225,6 @@ static int scm_worker_thread(void *unused) {
   unsigned long checksum = 0;
   int i;
 
-  //	int										_exit
-  //= 0;
-
 #if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
   unsigned long long ia32_addr;
 #endif
@@ -223,19 +246,21 @@ static int scm_worker_thread(void *unused) {
   for (;;) {
 
     checksum = scm_checksum((void *)sys_call_table, SYS_CALL_TABLE_SIZE);
-    if (checksum == tbl_checksum)
-      break;
+
+    if (checksum == tbl_checksum) {
+
+      scm_free_list();
+      goto next;
+    }
 
     // compare each table entry since we are not integer anymore
     for (i = 0; i < NR_syscalls; i++) {
 
-      if ((!scm_find_list_item((unsigned long)sys_call_table[i], i)) &&
-          ((unsigned long *)sys_call_table[i] ==
-           (unsigned long *)shadow_sys_call_tbl[i]))
+      if ((unsigned long *)sys_call_table[i] ==
+          (unsigned long *)shadow_sys_call_tbl[i])
         continue;
 
-      // old entry which can be cleaned?
-      if (scm_clean_up_list(sys_call_table[i], i))
+      if (scm_find_list_item(sys_call_table[i], i))
         continue;
 
       kmodule = scm_get_module((unsigned long)sys_call_table[i]);
@@ -264,6 +289,7 @@ static int scm_worker_thread(void *unused) {
       }
     }
 
+  next:
 #if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
 
     ia32_addr = native_read_msr(MSR_IA32_SYSENTER_EIP);
@@ -339,6 +365,10 @@ static int scm_worker_thread(void *unused) {
       break;
   }
 
+#ifdef DEBUG
+  printk("sysc_mon: thread was killed\n");
+#endif
+
   return 0;
 }
 
@@ -387,8 +417,6 @@ static void __exit _stop_sysc_mon(void) {
 #endif
 
   kthread_stop(scm_task);
-
-  //    kfree(shadow_sys_call_tbl);
 
 #ifdef DEBUG
   printk(KERN_DEBUG "sysc_mon: <--- _stop_sysc_mon()\n");
