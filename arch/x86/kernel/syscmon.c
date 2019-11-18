@@ -16,17 +16,23 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/sys.h>
 #include <linux/syscalls.h>
 
 #define DEBUG 1
 #define SCM_SLEEP (5 * HZ)
 #define SYS_CALL_TABLE_SIZE NR_syscalls * sizeof(long)
+#define SCM_PROC_BASE_NAME "syscall_monitor"
+
+static DEFINE_SPINLOCK(scm_spinlock);
 
 static unsigned long *shadow_sys_call_tbl[SYS_CALL_TABLE_SIZE];
-// static struct   mutex       scm_mtx;
+static struct mutex scm_mtx;
 static struct task_struct *scm_task;
 static struct module *kmodule;
+static struct list_head change_event_list;
+static struct proc_dir_entry *scm_proc_file;
 
 static unsigned long tbl_checksum = 0;
 static unsigned int scm_gdt_checksum = 0;
@@ -47,6 +53,15 @@ extern const unsigned long sys_call_table[SYS_CALL_TABLE_SIZE];
 extern void print_modules(void);
 asmlinkage int system_call(void);
 
+static int scm_proc_open(struct inode *, struct file *);
+static int scm_proc_show_events(struct seq_file *, void *);
+
+static const struct file_operations proc_scm_fops = {
+    .open = scm_proc_open,
+    .read = seq_read,
+    .release = single_release,
+};
+
 /*
  * scm_checksum()
  * Calculate checksum and return this.
@@ -64,7 +79,7 @@ static unsigned long scm_checksum(void *addr, unsigned int length) {
   return checksum;
 }
 
-struct sys_call_table_change {
+struct table_change_event {
   /* resposible module */
   struct module *mod;
 
@@ -75,10 +90,10 @@ struct sys_call_table_change {
   /* syscall number */
   u16 syscall_nr;
 
-  struct list_head next;
+  struct list_head entry;
 };
 
-static LIST_HEAD(table_change_list);
+// static LIST_HEAD(change_event_list);
 
 /*
  * scm_table_change_add()
@@ -86,18 +101,18 @@ static LIST_HEAD(table_change_list);
  */
 int scm_table_change_add(struct module *mod, unsigned long origin,
                          unsigned long new_ptr, u16 syscall_nr) {
-  struct sys_call_table_change *item;
+  struct table_change_event *event;
 
-  item = kzalloc(sizeof(item), GFP_KERNEL);
-  if (item == NULL)
+  event = kzalloc(sizeof(event), GFP_KERNEL);
+  if (event == NULL)
     return 0;
 
-  item->mod = mod;
-  item->origin = origin;
-  item->new_ptr = new_ptr;
-  item->syscall_nr = syscall_nr;
+  event->mod = mod;
+  event->origin = origin;
+  event->new_ptr = new_ptr;
+  event->syscall_nr = syscall_nr;
 
-  list_add_tail(&item->next, &table_change_list);
+  list_add_tail(&event->entry, &change_event_list);
 
   return 1;
 }
@@ -107,11 +122,11 @@ int scm_table_change_add(struct module *mod, unsigned long origin,
  * Search entrys in the changes list.
  */
 int scm_find_list_item(unsigned long new_ptr, u16 syscall_nr) {
-  struct sys_call_table_change *item;
+  struct table_change_event *event;
 
   // find a particular entry
-  list_for_each_entry(item, &table_change_list, next) {
-    if (item->new_ptr != new_ptr || item->syscall_nr != syscall_nr)
+  list_for_each_entry(event, &change_event_list, entry) {
+    if (event->new_ptr != new_ptr || event->syscall_nr != syscall_nr)
       continue;
     else
       return 1;
@@ -121,45 +136,22 @@ int scm_find_list_item(unsigned long new_ptr, u16 syscall_nr) {
 }
 
 /*
- * scm_find_list_item()
+ * scm_del_event()
  * Clean up old entrys.
  */
-int scm_clean_up_list(unsigned long addr, u16 syscall_nr) {
-  struct sys_call_table_change *item;
+int scm_del_event(unsigned long addr, u16 syscall_nr) {
+  struct table_change_event *event;
+  struct list_head *list, *safe;
 
-  list_for_each_entry(item, &table_change_list, next) {
-    if (item->syscall_nr == syscall_nr && item->new_ptr != addr) {
-      printk("Found a list entry for deletion. %lx - %i\n", addr, syscall_nr);
-
-      list_del(&item->next);
-      kfree(item);
+  list_for_each_safe(list, safe, &change_event_list) {
+    event = list_entry(list, struct table_change_event, entry);
+    if (event->syscall_nr == syscall_nr && event->new_ptr != addr) {
+      list_del(&event->entry);
+      kfree(event);
       return 1;
     }
   }
   return 0;
-}
-
-/*
- * scm_free_list()
- *
- */
-void scm_free_list(void) {
-  struct sys_call_table_change *item;
-  struct list_head *list, *safe;
-
-  if (list_empty(&table_change_list))
-    return;
-
-  list_for_each_safe(list, safe, &table_change_list) {
-    item = list_entry(list, struct sys_call_table_change, next);
-    printk("scm_free_list: Debug1\n");
-
-    list_del(&item->next);
-    printk("scm_free_list: Debug2\n");
-
-    kfree(item);
-    printk("scm_free_list: Debug3\n");
-  }
 }
 
 static inline void scm_read_idt_entry(gate_desc *gate, unsigned int vector,
@@ -216,6 +208,29 @@ static struct module *scm_get_module(unsigned long addr) {
   return mod;
 }
 
+static int scm_proc_open(struct inode *inode, struct file *file) {
+  return single_open(file, scm_proc_show_events, NULL);
+}
+
+static int scm_proc_show_events(struct seq_file *s, void *v) {
+  struct table_change_event *event;
+  unsigned long flags;
+
+  seq_printf(s, "%-30s %-30s %-30s %s\n", "intercepted syscall number",
+             "origin syscall address", "new address", "module name");
+
+  spin_lock_irqsave(&scm_spinlock, flags);
+
+  list_for_each_entry(event, &change_event_list, entry) {
+    seq_printf(s, "%-30i %-30lx %-30lx %s\n", event->syscall_nr, event->origin,
+               event->new_ptr, event->mod ? event->mod->name : "kernel");
+  }
+
+  spin_unlock_irqrestore(&scm_spinlock, flags);
+
+  return 0;
+}
+
 /*
  * scm_test_func()
  * Worker thread which checks the table periodical.
@@ -232,8 +247,6 @@ static int scm_worker_thread(void *unused) {
 #ifdef DEBUG
   printk("sysc_mon: thread was started\n");
 #endif
-  // save the currennt segment discriptors
-  // scm_init_dt_checksums();
 
 #if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
   ia32_sysenter_func = native_read_msr(MSR_IA32_SYSENTER_EIP);
@@ -249,7 +262,12 @@ static int scm_worker_thread(void *unused) {
 
     if (checksum == tbl_checksum) {
 
-      scm_free_list();
+      if (!list_empty(&change_event_list)) {
+
+        for (i = 0; i < NR_syscalls; i++)
+          scm_del_event(sys_call_table[i], i);
+      }
+
       goto next;
     }
 
@@ -391,6 +409,17 @@ static int __init _init_sysc_mon(void) {
 #endif
 
   init_shadow_table();
+
+  mutex_init(&scm_mtx);
+
+  INIT_LIST_HEAD(&change_event_list);
+
+  scm_proc_file =
+      proc_create_data(SCM_PROC_BASE_NAME, S_IRUGO, NULL, &proc_scm_fops, NULL);
+  if (!scm_proc_file) {
+    printk(KERN_ERR "syscmon: unable to create %s proc file system entry\n",
+           SCM_PROC_BASE_NAME);
+  }
 
   scm_task = kthread_create(scm_worker_thread, NULL, "scm");
   if (IS_ERR(scm_task)) {
