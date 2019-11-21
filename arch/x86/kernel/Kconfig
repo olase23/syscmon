@@ -1,0 +1,9 @@
+config SYSCMON
+	bool "sys_call_table integrity monitor"
+	default n
+	help
+	  Say Y here if you want to enable the sys_call_table monitor.
+    It checks periodically if the CPU specific fast system call registers
+    or the syscall table changed after the boot.
+
+	  This option is experimental.
