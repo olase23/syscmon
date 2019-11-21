@@ -1,10 +1,9 @@
-#include <linux/module.h>
-
 #include <asm/asm-offsets.h>
 #include <asm/cpufeature.h>
 #include <asm/desc.h>
 #include <asm/msr-index.h>
 #include <asm/msr.h>
+#include <asm/processor.h>
 #include <asm/syscalls.h>
 #include <asm/unistd.h>
 #include <linux/cache.h>
@@ -13,6 +12,7 @@
 #include <linux/linkage.h>
 #include <linux/list.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -25,34 +25,28 @@
 #define SYS_CALL_TABLE_SIZE NR_syscalls * sizeof(long)
 #define SCM_PROC_BASE_NAME "syscall_monitor"
 
-static DEFINE_SPINLOCK(scm_spinlock);
+static DEFINE_SPINLOCK(event_list_lock);
 
 static unsigned long *shadow_sys_call_tbl[SYS_CALL_TABLE_SIZE];
-static struct mutex scm_mtx;
+
 static struct task_struct *scm_task;
-static struct module *kmodule;
 static struct list_head change_event_list;
 static struct proc_dir_entry *scm_proc_file;
+static struct mutex event_mtx;
+static struct module *kmodule;
 
 static unsigned long tbl_checksum = 0;
+static unsigned long long ia32_sysenter_func = 0;
+static unsigned long long syscall_func = 0;
+
 static unsigned int scm_gdt_checksum = 0;
 static unsigned int scm_idt_checksum = 0;
 
-#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
-static unsigned long long ia32_sysenter_func = 0;
-#endif
-
-#ifdef CONFIG_X86_64
-static unsigned long long syscall_func = 0;
-#endif
-
-void init_shadow_table(void);
-
 extern const unsigned long sys_call_table[SYS_CALL_TABLE_SIZE];
-
 extern void print_modules(void);
 asmlinkage int system_call(void);
 
+void init_shadow_table(void);
 static int scm_proc_open(struct inode *, struct file *);
 static int scm_proc_show_events(struct seq_file *, void *);
 
@@ -61,6 +55,36 @@ static const struct file_operations proc_scm_fops = {
     .read = seq_read,
     .release = single_release,
 };
+
+struct table_change_event {
+  /* resposible module */
+  char module_name[MODULE_NAME_LEN];
+
+  /* ptrs to the funtions */
+  unsigned long origin;
+  unsigned long new_ptr;
+
+  /* syscall number */
+  u16 syscall_nr;
+
+  struct list_head entry;
+};
+
+static void scm_get_cpu_mode(void) {
+
+  if (boot_cpu_has(X86_FEATURE_SYSCALL32)) {
+    ia32_sysenter_func = native_read_msr(MSR_IA32_SYSENTER_EIP);
+  }
+
+  if (boot_cpu_has(X86_FEATURE_SEP)) {
+    syscall_func = native_read_msr(MSR_LSTAR);
+  }
+
+  printk("syscmon: SYSENTER IA32e mode: %s\n"
+         "syscmon: Fast System Calls in 64-Bit mode: %s\n",
+         ia32_sysenter_func ? "enabled" : "disabled",
+         syscall_func ? "enabled" : "disabled");
+}
 
 /*
  * scm_checksum()
@@ -79,22 +103,6 @@ static unsigned long scm_checksum(void *addr, unsigned int length) {
   return checksum;
 }
 
-struct table_change_event {
-  /* resposible module */
-  struct module *mod;
-
-  /* ptrs to the funtions */
-  unsigned long origin;
-  unsigned long new_ptr;
-
-  /* syscall number */
-  u16 syscall_nr;
-
-  struct list_head entry;
-};
-
-// static LIST_HEAD(change_event_list);
-
 /*
  * scm_table_change_add()
  * Add a new entry to the changes list.
@@ -107,12 +115,16 @@ int scm_table_change_add(struct module *mod, unsigned long origin,
   if (event == NULL)
     return 0;
 
-  event->mod = mod;
+  if (mod)
+    strncpy(event->module_name, mod->name, MODULE_NAME_LEN);
+
   event->origin = origin;
   event->new_ptr = new_ptr;
   event->syscall_nr = syscall_nr;
 
+  spin_lock(&event_list_lock);
   list_add_tail(&event->entry, &change_event_list);
+  spin_unlock(&event_list_lock);
 
   return 1;
 }
@@ -123,16 +135,20 @@ int scm_table_change_add(struct module *mod, unsigned long origin,
  */
 int scm_find_list_item(unsigned long new_ptr, u16 syscall_nr) {
   struct table_change_event *event;
+  int ret = 0;
+
+  spin_lock(&event_list_lock);
 
   // find a particular entry
   list_for_each_entry(event, &change_event_list, entry) {
     if (event->new_ptr != new_ptr || event->syscall_nr != syscall_nr)
       continue;
     else
-      return 1;
+      ret = 1;
   }
 
-  return 0;
+  spin_unlock(&event_list_lock);
+  return ret;
 }
 
 /*
@@ -142,16 +158,22 @@ int scm_find_list_item(unsigned long new_ptr, u16 syscall_nr) {
 int scm_del_event(unsigned long addr, u16 syscall_nr) {
   struct table_change_event *event;
   struct list_head *list, *safe;
+  int ret = 0;
+
+  spin_lock(&event_list_lock);
 
   list_for_each_safe(list, safe, &change_event_list) {
     event = list_entry(list, struct table_change_event, entry);
     if (event->syscall_nr == syscall_nr && event->new_ptr != addr) {
       list_del(&event->entry);
       kfree(event);
-      return 1;
+
+      ret = 1;
     }
   }
-  return 0;
+
+  spin_unlock(&event_list_lock);
+  return ret;
 }
 
 static inline void scm_read_idt_entry(gate_desc *gate, unsigned int vector,
@@ -212,21 +234,25 @@ static int scm_proc_open(struct inode *inode, struct file *file) {
   return single_open(file, scm_proc_show_events, NULL);
 }
 
+/*
+ * scm_proc_show_events()
+ * proc filesystem interface
+ */
 static int scm_proc_show_events(struct seq_file *s, void *v) {
   struct table_change_event *event;
-  unsigned long flags;
 
-  seq_printf(s, "%-30s %-30s %-30s %s\n", "intercepted syscall number",
-             "origin syscall address", "new address", "module name");
+  seq_printf(s, "%-30s %-30s %-30s %s\n", "changed syscall number",
+             "origin address", "new address", "module name");
 
-  spin_lock_irqsave(&scm_spinlock, flags);
+  spin_lock(&event_list_lock);
 
   list_for_each_entry(event, &change_event_list, entry) {
     seq_printf(s, "%-30i %-30lx %-30lx %s\n", event->syscall_nr, event->origin,
-               event->new_ptr, event->mod ? event->mod->name : "kernel");
+               event->new_ptr,
+               event->module_name ? event->module_name : "kernel");
   }
 
-  spin_unlock_irqrestore(&scm_spinlock, flags);
+  spin_unlock(&event_list_lock);
 
   return 0;
 }
@@ -238,22 +264,11 @@ static int scm_proc_show_events(struct seq_file *s, void *v) {
 static int scm_worker_thread(void *unused) {
   unsigned long long _addr_ = 0;
   unsigned long checksum = 0;
-  int i;
-
-#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
   unsigned long long ia32_addr;
-#endif
+  int i;
 
 #ifdef DEBUG
   printk("sysc_mon: thread was started\n");
-#endif
-
-#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
-  ia32_sysenter_func = native_read_msr(MSR_IA32_SYSENTER_EIP);
-#endif
-
-#ifdef CONFIG_X86_64
-  syscall_func = native_read_msr(MSR_LSTAR);
 #endif
 
   for (;;) {
@@ -308,7 +323,11 @@ static int scm_worker_thread(void *unused) {
     }
 
   next:
+
 #if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
+
+    if (!ia32_sysenter_func)
+      goto skip_ia32;
 
     ia32_addr = native_read_msr(MSR_IA32_SYSENTER_EIP);
     if (ia32_addr != ia32_sysenter_func) {
@@ -336,7 +355,7 @@ static int scm_worker_thread(void *unused) {
         }
       }
     }
-
+  skip_ia32:
 #endif
 
 #ifdef CONFIG_X86_64
@@ -384,16 +403,12 @@ static int scm_worker_thread(void *unused) {
   }
 
 #ifdef DEBUG
-  printk("sysc_mon: thread was killed\n");
+  printk("sysc_mon: main thread was killed\n");
 #endif
 
   return 0;
 }
 
-/*
- * init_shadow_table()
- * Try to find the module and print its name.
- */
 void init_shadow_table(void) {
 
   memcpy(shadow_sys_call_tbl, sys_call_table, SYS_CALL_TABLE_SIZE);
@@ -404,13 +419,13 @@ void init_shadow_table(void) {
 static int __init _init_sysc_mon(void) {
   int error = 0;
 
-#ifdef DEBUG
-  printk(KERN_DEBUG "sysc_mon: ---> _init_sysc_mon()\n");
-#endif
+  printk(KERN_INFO "syscmon: syscall table monitor\n");
 
   init_shadow_table();
 
-  mutex_init(&scm_mtx);
+  scm_get_cpu_mode();
+
+  // mutex_init(&event_mtx);
 
   INIT_LIST_HEAD(&change_event_list);
 
@@ -431,25 +446,7 @@ static int __init _init_sysc_mon(void) {
   }
 
   wake_up_process(scm_task);
-
-#ifdef DEBUG
-  printk(KERN_DEBUG "sysc_mon: <--- _init_sysc_mon()\n");
-#endif
-
   return 0;
-}
-
-static void __exit _stop_sysc_mon(void) {
-
-#ifdef DEBUG
-  printk(KERN_DEBUG "sysc_mon: ---> _stop_sysc_mon()\n");
-#endif
-
-  kthread_stop(scm_task);
-
-#ifdef DEBUG
-  printk(KERN_DEBUG "sysc_mon: <--- _stop_sysc_mon()\n");
-#endif
 }
 
 #ifdef CONFIG_X86_64
@@ -459,3 +456,5 @@ subsys_initcall(_init_sysc_mon);
 #endif
 
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("syscall table monitor");
+MODULE_AUTHOR("Olaf Schmerse <olase23@gmail.com>");
