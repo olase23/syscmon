@@ -52,16 +52,14 @@ static DEFINE_SPINLOCK(event_list_lock);
 
 static unsigned long *shadow_sys_call_tbl[SYS_CALL_TABLE_SIZE];
 
-static struct task_struct *scm_task;
-static struct list_head change_event_list;
 static struct proc_dir_entry *scm_proc_file;
-static struct mutex event_mtx;
+static struct list_head change_event_list;
+static struct task_struct *scm_task;
 static struct module *kmodule;
 
-static unsigned long tbl_checksum = 0;
 static unsigned long long ia32_sysenter_func = 0;
 static unsigned long long syscall_func = 0;
-
+static unsigned long tbl_checksum = 0;
 static unsigned int scm_gdt_checksum = 0;
 static unsigned int scm_idt_checksum = 0;
 
@@ -388,33 +386,34 @@ static int scm_worker_thread(void *unused) {
      * segment mode
      */
 
-    if (syscall_func != 0) {
+    if (!syscall_func)
+      goto skip_x64;
 
-      _addr_ = native_read_msr(MSR_LSTAR);
-      if (_addr_ != syscall_func) {
+    _addr_ = native_read_msr(MSR_LSTAR);
+    if (_addr_ != syscall_func) {
 
-        if (_addr_) {
+      if (_addr_) {
 
-          kmodule = scm_get_module((unsigned long)_addr_);
+        kmodule = scm_get_module((unsigned long)_addr_);
 
-          if (!kmodule) {
+        if (!kmodule) {
 
-            printk(KERN_WARNING "sysc_mon: Attantion MSR_LSTAR was changed: \n"
-                                "origin ia32_sysenter_target: %llx \n"
-                                "new ia32_sysenter_target: %llx \n",
-                   syscall_func, _addr_);
+          printk(KERN_WARNING "sysc_mon: Attantion MSR_LSTAR was changed: \n"
+                              "origin long SYSCALL target: %llx \n"
+                              "new long SYSCALL target: %llx \n",
+                 syscall_func, _addr_);
 
-          } else {
+        } else {
 
-            printk(KERN_WARNING "sysc_mon: Attantion MSR_LSTAR was changed: \n"
-                                "origin ia32_sysenter_target: %llx \n"
-                                "new function ia32_sysenter_target: %llx \n"
-                                "is now located in module: %s\n",
-                   syscall_func, _addr_, kmodule->name);
-          }
+          printk(KERN_WARNING "sysc_mon: Attantion MSR_LSTAR was changed: \n"
+                              "origin long SYSCALL target: %llx \n"
+                              "new function long SYSCALL target: %llx \n"
+                              "is now located in module: %s\n",
+                 syscall_func, _addr_, kmodule->name);
         }
       }
     }
+  skip_x64:
 #endif
 
     schedule_timeout(msecs_to_jiffies(SCM_SLEEP));
