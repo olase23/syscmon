@@ -53,11 +53,13 @@ static DEFINE_SPINLOCK(event_list_lock);
 static unsigned long *shadow_sys_call_tbl[SYS_CALL_TABLE_SIZE];
 
 static struct proc_dir_entry *scm_proc_file;
-static struct list_head change_event_list;
+static struct list_head event_log_list;
+static struct list_head entry_event_list;
 static struct task_struct *scm_task;
 static struct module *kmodule;
 
 static unsigned long long ia32_sysenter_func = 0;
+static unsigned long long ia32_syscall_func = 0;
 static unsigned long long syscall_func = 0;
 static unsigned long tbl_checksum = 0;
 static unsigned int scm_gdt_checksum = 0;
@@ -65,7 +67,11 @@ static unsigned int scm_idt_checksum = 0;
 
 extern const unsigned long sys_call_table[SYS_CALL_TABLE_SIZE];
 extern void print_modules(void);
-asmlinkage int system_call(void);
+
+extern void system_call(void);
+extern void ia32_syscall(void);
+extern void ia32_cstar_target(void);
+extern void ia32_sysenter_target(void);
 
 void init_shadow_table(void);
 static int scm_proc_open(struct inode *, struct file *);
@@ -77,32 +83,58 @@ static const struct file_operations proc_scm_fops = {
     .release = single_release,
 };
 
-struct table_change_event {
+/*
+ *  change event log
+ */
+struct change_event_log {
   /* resposible module */
   char module_name[MODULE_NAME_LEN];
 
-  /* ptrs to the funtions */
-  unsigned long origin;
-  unsigned long new_ptr;
+  /* addr to the funtions */
+  unsigned long o_addr;
+  unsigned long c_addr;
 
   /* syscall number */
-  u16 syscall_nr;
+  int syscall_nr;
 
   struct list_head entry;
 };
 
-static void scm_get_cpu_mode(void) {
+static void scm_init_entry_mode(void) {
 
   if (boot_cpu_has(X86_FEATURE_SYSCALL32)) {
+    ia32_syscall_func = native_read_msr(MSR_CSTAR);
+    if (ia32_syscall_func) {
+      if (ia32_syscall_func != (unsigned long long)ia32_cstar_target)
+        printk(KERN_WARNING "syscmon: current IA32e SYSCALL entry differs from "
+                            "proper entry point: %llx - %llx\n",
+               ia32_syscall_func, (unsigned long long)ia32_cstar_target);
+    }
+
     ia32_sysenter_func = native_read_msr(MSR_IA32_SYSENTER_EIP);
+    if (ia32_sysenter_func) {
+      if (ia32_sysenter_func != (unsigned long long)ia32_sysenter_target)
+        printk(KERN_WARNING
+               "syscmon: current IA32e SYSENTER entry differs from "
+               "proper entry point: %llx - %llx\n",
+               ia32_sysenter_func, (unsigned long long)ia32_sysenter_target);
+    }
   }
 
   if (boot_cpu_has(X86_FEATURE_SEP)) {
     syscall_func = native_read_msr(MSR_LSTAR);
+    if (syscall_func) {
+      if (syscall_func != (unsigned long long)system_call)
+        printk(KERN_WARNING "syscmon: current SYSCALL entry differs from "
+                            "proper entry point: %llx - %llx\n",
+               syscall_func, (unsigned long long)system_call);
+    }
   }
 
-  printk("syscmon: SYSENTER IA32e mode: %s\n"
+  printk("syscmon: SYSCALL IA32e mode: %s\n"
+         "syscmon: SYSENTER IA32e mode: %s\n"
          "syscmon: Fast System Calls in 64-Bit mode: %s\n",
+         ia32_syscall_func ? "enabled" : "disabled",
          ia32_sysenter_func ? "enabled" : "disabled",
          syscall_func ? "enabled" : "disabled");
 }
@@ -128,23 +160,23 @@ static unsigned long scm_checksum(void *addr, unsigned int length) {
  * scm_table_change_add()
  * Add a new entry to the changes list.
  */
-int scm_table_change_add(struct module *mod, unsigned long origin,
-                         unsigned long new_ptr, u16 syscall_nr) {
-  struct table_change_event *event;
+int scm_log_add(struct module *mod, unsigned long o_addr, unsigned long c_addr,
+                int syscall_nr) {
+  struct change_event_log *log;
 
-  event = kzalloc(sizeof(event), GFP_KERNEL);
-  if (event == NULL)
+  log = kzalloc(sizeof(log), GFP_KERNEL);
+  if (log == NULL)
     return 0;
 
   if (mod)
-    strncpy(event->module_name, mod->name, MODULE_NAME_LEN);
+    strncpy(log->module_name, mod->name, MODULE_NAME_LEN);
 
-  event->origin = origin;
-  event->new_ptr = new_ptr;
-  event->syscall_nr = syscall_nr;
+  log->o_addr = o_addr;
+  log->c_addr = c_addr;
+  log->syscall_nr = syscall_nr;
 
   spin_lock(&event_list_lock);
-  list_add_tail(&event->entry, &change_event_list);
+  list_add_tail(&log->entry, &event_log_list);
   spin_unlock(&event_list_lock);
 
   return 1;
@@ -154,15 +186,15 @@ int scm_table_change_add(struct module *mod, unsigned long origin,
  * scm_find_list_item()
  * Search entrys in the changes list.
  */
-int scm_find_list_item(unsigned long new_ptr, u16 syscall_nr) {
-  struct table_change_event *event;
+int scm_find_list_item(unsigned long c_addr, u16 syscall_nr) {
+  struct change_event_log *event;
   int ret = 0;
 
   spin_lock(&event_list_lock);
 
   // find a particular entry
-  list_for_each_entry(event, &change_event_list, entry) {
-    if (event->new_ptr != new_ptr || event->syscall_nr != syscall_nr)
+  list_for_each_entry(event, &event_log_list, entry) {
+    if (event->c_addr != c_addr || event->syscall_nr != syscall_nr)
       continue;
     else
       ret = 1;
@@ -177,15 +209,15 @@ int scm_find_list_item(unsigned long new_ptr, u16 syscall_nr) {
  * Clean up old entrys.
  */
 int scm_del_event(unsigned long addr, u16 syscall_nr) {
-  struct table_change_event *event;
+  struct change_event_log *event;
   struct list_head *list, *safe;
   int ret = 0;
 
   spin_lock(&event_list_lock);
 
-  list_for_each_safe(list, safe, &change_event_list) {
-    event = list_entry(list, struct table_change_event, entry);
-    if (event->syscall_nr == syscall_nr && event->new_ptr != addr) {
+  list_for_each_safe(list, safe, &event_log_list) {
+    event = list_entry(list, struct change_event_log, entry);
+    if (event->syscall_nr == syscall_nr && event->c_addr != addr) {
       list_del(&event->entry);
       kfree(event);
 
@@ -260,17 +292,17 @@ static int scm_proc_open(struct inode *inode, struct file *file) {
  * proc filesystem interface
  */
 static int scm_proc_show_events(struct seq_file *s, void *v) {
-  struct table_change_event *event;
+  struct change_event_log *log;
 
   seq_printf(s, "%-30s %-30s %-30s %s\n", "changed syscall number",
-             "origin address", "new address", "module name");
+             "o_addr address", "new address", "module name");
 
   spin_lock(&event_list_lock);
 
-  list_for_each_entry(event, &change_event_list, entry) {
-    seq_printf(s, "%-30i %-30lx %-30lx %s\n", event->syscall_nr, event->origin,
-               event->new_ptr,
-               event->module_name ? event->module_name : "kernel");
+  list_for_each_entry(log, &event_log_list, entry) {
+    if (log->syscall_nr != -1)
+      seq_printf(s, "%-30i %-30lx %-30lx %s\n", log->syscall_nr, log->o_addr,
+                 log->c_addr, log->module_name ? log->module_name : "kernel");
   }
 
   spin_unlock(&event_list_lock);
@@ -283,9 +315,9 @@ static int scm_proc_show_events(struct seq_file *s, void *v) {
  * Worker thread which checks the table periodical.
  */
 static int scm_worker_thread(void *unused) {
-  unsigned long long _addr_ = 0;
+  unsigned long long entry_addr = 0;
   unsigned long checksum = 0;
-  unsigned long long ia32_addr;
+  int cpu;
   int i;
 
 #ifdef DEBUG
@@ -298,7 +330,7 @@ static int scm_worker_thread(void *unused) {
 
     if (checksum == tbl_checksum) {
 
-      if (!list_empty(&change_event_list)) {
+      if (!list_empty(&event_log_list)) {
 
         for (i = 0; i < NR_syscalls; i++)
           scm_del_event(sys_call_table[i], i);
@@ -319,14 +351,14 @@ static int scm_worker_thread(void *unused) {
 
       kmodule = scm_get_module((unsigned long)sys_call_table[i]);
 
-      scm_table_change_add(kmodule, (unsigned long)shadow_sys_call_tbl[i],
-                           (unsigned long)sys_call_table[i], i);
+      scm_log_add(kmodule, (unsigned long)shadow_sys_call_tbl[i],
+                  (unsigned long)sys_call_table[i], i);
 
       if (!kmodule) {
 
         printk(KERN_WARNING
                "sysc_mon: Attantion entry in the sys call table was changed: \n"
-               "origin sys call entry: %lx \n"
+               "o_addr sys call entry: %lx \n"
                "new sys call entry: %lx \n",
                (unsigned long)shadow_sys_call_tbl[i],
                (unsigned long)sys_call_table[i]);
@@ -335,7 +367,7 @@ static int scm_worker_thread(void *unused) {
 
         printk(KERN_WARNING
                "sysc_mon: Attantion entry in the sys call table was changed: \n"
-               "origin sys call entry: %lx \n"
+               "o_addr sys call entry: %lx \n"
                "new sys call entry: %lx \n"
                "is now located in module: %s\n",
                (unsigned long)shadow_sys_call_tbl[i],
@@ -350,29 +382,35 @@ static int scm_worker_thread(void *unused) {
     if (!ia32_sysenter_func)
       goto skip_ia32;
 
-    ia32_addr = native_read_msr(MSR_IA32_SYSENTER_EIP);
-    if (ia32_addr != ia32_sysenter_func) {
+    for_each_present_cpu(cpu) {
 
-      if (ia32_addr) {
+      entry_addr = native_read_msr(MSR_IA32_SYSENTER_EIP);
+      if (entry_addr != ia32_sysenter_func) {
 
-        kmodule = scm_get_module(ia32_addr);
+        if (scm_find_list_item(entry_addr, -1))
+          continue;
+
+        kmodule = scm_get_module(entry_addr);
+
+        scm_log_add(kmodule, (unsigned long)ia32_sysenter_func,
+                    (unsigned long)entry_addr, -1);
 
         if (!kmodule) {
 
           printk(KERN_WARNING
                  "sysc_mon: Attantion MSR_IA32_SYSENTER_EIP was changed: \n"
-                 "origin ia32_sysenter_target: %llx \n"
+                 "o_addr ia32_sysenter_target: %llx \n"
                  "new ia32_sysenter_target: %llx \n",
-                 ia32_sysenter_func, ia32_addr);
+                 ia32_sysenter_func, entry_addr);
 
         } else {
 
           printk(KERN_WARNING
                  "sysc_mon: Attantion MSR_IA32_SYSENTER_EIP was changed: \n"
-                 "origin ia32_sysenter_target: %llx \n"
+                 "o_addr ia32_sysenter_target: %llx \n"
                  "new function ia32_sysenter_target: %llx \n"
                  "is now located in module: %s\n",
-                 ia32_sysenter_func, ia32_addr, kmodule->name);
+                 ia32_sysenter_func, entry_addr, kmodule->name);
         }
       }
     }
@@ -389,32 +427,74 @@ static int scm_worker_thread(void *unused) {
     if (!syscall_func)
       goto skip_x64;
 
-    _addr_ = native_read_msr(MSR_LSTAR);
-    if (_addr_ != syscall_func) {
+    for_each_present_cpu(cpu) {
 
-      if (_addr_) {
+      entry_addr = native_read_msr(MSR_LSTAR);
+      if (entry_addr != syscall_func) {
 
-        kmodule = scm_get_module((unsigned long)_addr_);
+        if (scm_find_list_item(entry_addr, -1))
+          continue;
+
+        kmodule = scm_get_module((unsigned long)entry_addr);
+
+        scm_log_add(kmodule, (unsigned long)ia32_sysenter_func,
+                    (unsigned long)entry_addr, -1);
 
         if (!kmodule) {
 
           printk(KERN_WARNING "sysc_mon: Attantion MSR_LSTAR was changed: \n"
-                              "origin long SYSCALL target: %llx \n"
+                              "o_addr long SYSCALL target: %llx \n"
                               "new long SYSCALL target: %llx \n",
-                 syscall_func, _addr_);
+                 syscall_func, entry_addr);
 
         } else {
 
           printk(KERN_WARNING "sysc_mon: Attantion MSR_LSTAR was changed: \n"
-                              "origin long SYSCALL target: %llx \n"
+                              "o_addr long SYSCALL target: %llx \n"
                               "new function long SYSCALL target: %llx \n"
                               "is now located in module: %s\n",
-                 syscall_func, _addr_, kmodule->name);
+                 syscall_func, entry_addr, kmodule->name);
         }
       }
     }
   skip_x64:
 #endif
+
+    if (!ia32_syscall_func)
+      continue;
+
+    for_each_present_cpu(cpu) {
+
+      entry_addr = native_read_msr(MSR_CSTAR);
+      if (entry_addr != ia32_syscall_func) {
+
+        if (scm_find_list_item(entry_addr, -1))
+          continue;
+
+        kmodule = scm_get_module((unsigned long)entry_addr);
+
+        scm_log_add(kmodule, (unsigned long)ia32_syscall_func,
+                    (unsigned long)entry_addr, -1);
+
+        if (!kmodule) {
+
+          printk(KERN_WARNING
+                 "sysc_mon: Attantion IA32e SYSCALL  was changed: \n"
+                 "o_addr ia32_sysenter_target: %llx \n"
+                 "new ia32_sysenter_target: %llx \n",
+                 ia32_syscall_func, entry_addr);
+
+        } else {
+
+          printk(KERN_WARNING
+                 "sysc_mon: Attantion IA32e SYSCALL  was changed: \n"
+                 "o_addr ia32_sysenter_target: %llx \n"
+                 "new function ia32_sysenter_target: %llx \n"
+                 "is now located in module: %s\n",
+                 ia32_syscall_func, entry_addr, kmodule->name);
+        }
+      }
+    }
 
     schedule_timeout(msecs_to_jiffies(SCM_SLEEP));
 
@@ -445,11 +525,11 @@ static int __init _init_sysc_mon(void) {
 
   init_shadow_table();
 
-  scm_get_cpu_mode();
+  scm_init_entry_mode();
 
   // mutex_init(&event_mtx);
 
-  INIT_LIST_HEAD(&change_event_list);
+  INIT_LIST_HEAD(&event_log_list);
 
   scm_proc_file =
       proc_create_data(SCM_PROC_BASE_NAME, S_IRUGO, NULL, &proc_scm_fops, NULL);
