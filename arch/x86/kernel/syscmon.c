@@ -48,13 +48,12 @@
 #define SYS_CALL_TABLE_SIZE NR_syscalls * sizeof(long)
 #define SCM_PROC_BASE_NAME "syscall_monitor"
 
-static DEFINE_SPINLOCK(event_list_lock);
+static DEFINE_SPINLOCK(log_list_lock);
 
 static unsigned long *shadow_sys_call_tbl[SYS_CALL_TABLE_SIZE];
 
 static struct proc_dir_entry *scm_proc_file;
 static struct list_head event_log_list;
-static struct list_head entry_event_list;
 static struct task_struct *scm_task;
 static struct module *kmodule;
 
@@ -64,6 +63,7 @@ static unsigned long long syscall_func = 0;
 static unsigned long tbl_checksum = 0;
 static unsigned int scm_gdt_checksum = 0;
 static unsigned int scm_idt_checksum = 0;
+static unsigned long checksum = 0;
 
 extern const unsigned long sys_call_table[SYS_CALL_TABLE_SIZE];
 extern void print_modules(void);
@@ -87,8 +87,7 @@ static const struct file_operations proc_scm_fops = {
  *  change event log
  */
 struct change_event_log {
-  /* resposible module */
-  char module_name[MODULE_NAME_LEN];
+  struct list_head entry;
 
   /* addr to the funtions */
   unsigned long o_addr;
@@ -97,7 +96,11 @@ struct change_event_log {
   /* syscall number */
   int syscall_nr;
 
-  struct list_head entry;
+  /*msr change log type*/
+  u32 msr_reg;
+
+  /* resposible module */
+  char module_name[MODULE_NAME_LEN];
 };
 
 static void scm_init_entry_mode(void) {
@@ -144,63 +147,65 @@ static void scm_init_entry_mode(void) {
  * Calculate checksum and return this.
  */
 static unsigned long scm_checksum(void *addr, unsigned int length) {
-  unsigned long checksum = 0;
+  unsigned long csum = 0;
   unsigned long *table = (unsigned long *)addr;
 
   if (!length || !addr)
     return 0;
 
   while (length--)
-    checksum ^= *table++;
+    csum ^= *table++;
 
-  return checksum;
+  return csum;
 }
 
 /*
  * scm_table_change_add()
  * Add a new entry to the changes list.
  */
-int scm_log_add(struct module *mod, unsigned long o_addr, unsigned long c_addr,
-                int syscall_nr) {
+static int scm_log_add(struct module *mod, unsigned long o_addr,
+                       unsigned long c_addr, int syscall_nr, u32 msr_reg) {
   struct change_event_log *log;
 
-  log = kzalloc(sizeof(log), GFP_KERNEL);
+  log = kzalloc(sizeof(*log), GFP_KERNEL);
   if (log == NULL)
     return 0;
 
+  INIT_LIST_HEAD(&log->entry);
+
   if (mod)
-    strncpy(log->module_name, mod->name, MODULE_NAME_LEN);
+    strncpy(log->module_name, mod->name, strlen(mod->name));
 
   log->o_addr = o_addr;
   log->c_addr = c_addr;
   log->syscall_nr = syscall_nr;
+  log->msr_reg = msr_reg;
 
-  spin_lock(&event_list_lock);
-  list_add_tail(&log->entry, &event_log_list);
-  spin_unlock(&event_list_lock);
+  spin_lock(&log_list_lock);
+  list_add(&log->entry, &event_log_list);
+  spin_unlock(&log_list_lock);
 
   return 1;
 }
 
 /*
- * scm_find_list_item()
+ * scm_find_log_item()
  * Search entrys in the changes list.
  */
-int scm_find_list_item(unsigned long c_addr, u16 syscall_nr) {
-  struct change_event_log *event;
-  int ret = 0;
+struct change_event_log *scm_find_log_item(unsigned long c_addr, int syscall_nr,
+                                           u32 msr) {
+  struct change_event_log *log, *ret = NULL;
 
-  spin_lock(&event_list_lock);
+  spin_lock(&log_list_lock);
 
-  // find a particular entry
-  list_for_each_entry(event, &event_log_list, entry) {
-    if (event->c_addr != c_addr || event->syscall_nr != syscall_nr)
-      continue;
+  list_for_each_entry(log, &event_log_list, entry) {
+    if (log->c_addr == c_addr && log->syscall_nr == syscall_nr &&
+        log->msr_reg == msr)
+      ret = log;
     else
-      ret = 1;
+      continue;
   }
-
-  spin_unlock(&event_list_lock);
+  spin_unlock(&log_list_lock);
   return ret;
 }
 
@@ -208,25 +213,10 @@ int scm_find_list_item(unsigned long c_addr, u16 syscall_nr) {
  * scm_del_event()
  * Clean up old entrys.
  */
-int scm_del_event(unsigned long addr, u16 syscall_nr) {
-  struct change_event_log *event;
-  struct list_head *list, *safe;
-  int ret = 0;
+void scm_del_event(struct change_event_log *log_entry) {
 
-  spin_lock(&event_list_lock);
-
-  list_for_each_safe(list, safe, &event_log_list) {
-    event = list_entry(list, struct change_event_log, entry);
-    if (event->syscall_nr == syscall_nr && event->c_addr != addr) {
-      list_del(&event->entry);
-      kfree(event);
-
-      ret = 1;
-    }
-  }
-
-  spin_unlock(&event_list_lock);
-  return ret;
+  list_del(&log_entry->entry);
+  kfree(log_entry);
 }
 
 static inline void scm_read_idt_entry(gate_desc *gate, unsigned int vector,
@@ -294,18 +284,29 @@ static int scm_proc_open(struct inode *inode, struct file *file) {
 static int scm_proc_show_events(struct seq_file *s, void *v) {
   struct change_event_log *log;
 
-  seq_printf(s, "%-30s %-30s %-30s %s\n", "changed syscall number",
-             "o_addr address", "new address", "module name");
+  seq_printf(s, "%-30s %-30s %-30s %-30s %s\n", "changed syscall number",
+             "MSR register", "old address", "new address", "module name");
 
-  spin_lock(&event_list_lock);
+  spin_lock(&log_list_lock);
 
   list_for_each_entry(log, &event_log_list, entry) {
-    if (log->syscall_nr != -1)
-      seq_printf(s, "%-30i %-30lx %-30lx %s\n", log->syscall_nr, log->o_addr,
-                 log->c_addr, log->module_name ? log->module_name : "kernel");
+    if (log->msr_reg)
+      seq_printf(s, "%-30s %-30x %-30lx %-30lx %s\n", "--", log->msr_reg,
+                 log->o_addr, log->c_addr,
+                 log->module_name ? log->module_name : "kernel");
+    else
+      seq_printf(s, "%-30i %-30s %-30lx %-30lx %s\n", log->syscall_nr, "--",
+                 log->o_addr, log->c_addr,
+                 log->module_name ? log->module_name : "kernel");
   }
 
-  spin_unlock(&event_list_lock);
+  spin_unlock(&log_list_lock);
+
+  seq_printf(s, "\n\n");
+  seq_printf(s,
+             "init sys_call_table checksum: %lx \n"
+             "last sys_call_table checksum: %lx \n",
+             tbl_checksum, checksum);
 
   return 0;
 }
@@ -316,7 +317,7 @@ static int scm_proc_show_events(struct seq_file *s, void *v) {
  */
 static int scm_worker_thread(void *unused) {
   unsigned long long entry_addr = 0;
-  unsigned long checksum = 0;
+  struct change_event_log *log, *tmp;
   int cpu;
   int i;
 
@@ -329,13 +330,18 @@ static int scm_worker_thread(void *unused) {
     checksum = scm_checksum((void *)sys_call_table, SYS_CALL_TABLE_SIZE);
 
     if (checksum == tbl_checksum) {
-
       if (!list_empty(&event_log_list)) {
 
-        for (i = 0; i < NR_syscalls; i++)
-          scm_del_event(sys_call_table[i], i);
+        spin_lock(&log_list_lock);
+        list_for_each_entry_safe(log, tmp, &event_log_list, entry) {
+          if (log->syscall_nr > -1 &&
+              log->o_addr == sys_call_table[log->syscall_nr]) {
+            scm_del_event(log);
+          } else
+            continue;
+        }
+        spin_unlock(&log_list_lock);
       }
-
       goto next;
     }
 
@@ -346,13 +352,13 @@ static int scm_worker_thread(void *unused) {
           (unsigned long *)shadow_sys_call_tbl[i])
         continue;
 
-      if (scm_find_list_item(sys_call_table[i], i))
+      if (scm_find_log_item(sys_call_table[i], i, 0))
         continue;
 
       kmodule = scm_get_module((unsigned long)sys_call_table[i]);
 
       scm_log_add(kmodule, (unsigned long)shadow_sys_call_tbl[i],
-                  (unsigned long)sys_call_table[i], i);
+                  (unsigned long)sys_call_table[i], i, 0);
 
       if (!kmodule) {
 
@@ -387,13 +393,13 @@ static int scm_worker_thread(void *unused) {
       entry_addr = native_read_msr(MSR_IA32_SYSENTER_EIP);
       if (entry_addr != ia32_sysenter_func) {
 
-        if (scm_find_list_item(entry_addr, -1))
+        if (scm_find_log_item(entry_addr, -1, MSR_IA32_SYSENTER_EIP))
           continue;
 
         kmodule = scm_get_module(entry_addr);
 
         scm_log_add(kmodule, (unsigned long)ia32_sysenter_func,
-                    (unsigned long)entry_addr, -1);
+                    (unsigned long)entry_addr, -1, MSR_IA32_SYSENTER_EIP);
 
         if (!kmodule) {
 
@@ -432,13 +438,13 @@ static int scm_worker_thread(void *unused) {
       entry_addr = native_read_msr(MSR_LSTAR);
       if (entry_addr != syscall_func) {
 
-        if (scm_find_list_item(entry_addr, -1))
+        if (scm_find_log_item(entry_addr, -1, MSR_LSTAR))
           continue;
 
         kmodule = scm_get_module((unsigned long)entry_addr);
 
         scm_log_add(kmodule, (unsigned long)ia32_sysenter_func,
-                    (unsigned long)entry_addr, -1);
+                    (unsigned long)entry_addr, -1, MSR_LSTAR);
 
         if (!kmodule) {
 
@@ -468,37 +474,37 @@ static int scm_worker_thread(void *unused) {
       entry_addr = native_read_msr(MSR_CSTAR);
       if (entry_addr != ia32_syscall_func) {
 
-        if (scm_find_list_item(entry_addr, -1))
+        if (scm_find_log_item(entry_addr, -1, MSR_CSTAR))
           continue;
 
         kmodule = scm_get_module((unsigned long)entry_addr);
 
         scm_log_add(kmodule, (unsigned long)ia32_syscall_func,
-                    (unsigned long)entry_addr, -1);
+                    (unsigned long)entry_addr, -1, MSR_CSTAR);
 
         if (!kmodule) {
 
           printk(KERN_WARNING
-                 "sysc_mon: Attantion IA32e SYSCALL  was changed: \n"
-                 "o_addr ia32_sysenter_target: %llx \n"
-                 "new ia32_sysenter_target: %llx \n",
+                 "sysc_mon: Attantion IA32e SYSCALL was changed: \n"
+                 "original SYSCALL target: %llx \n"
+                 "new SYSCALL target: %llx \n",
                  ia32_syscall_func, entry_addr);
 
         } else {
 
           printk(KERN_WARNING
-                 "sysc_mon: Attantion IA32e SYSCALL  was changed: \n"
-                 "o_addr ia32_sysenter_target: %llx \n"
-                 "new function ia32_sysenter_target: %llx \n"
+                 "sysc_mon: Attantion IA32e SYSCALL was changed: \n"
+                 "original SYSCALL target: %llx \n"
+                 "new SYSCALL target: %llx \n"
                  "is now located in module: %s\n",
                  ia32_syscall_func, entry_addr, kmodule->name);
         }
       }
     }
 
-    schedule_timeout(msecs_to_jiffies(SCM_SLEEP));
-
     set_current_state(TASK_INTERRUPTIBLE);
+
+    schedule_timeout(msecs_to_jiffies(SCM_SLEEP));
 
     if (kthread_should_stop())
       break;
@@ -526,8 +532,6 @@ static int __init _init_sysc_mon(void) {
   init_shadow_table();
 
   scm_init_entry_mode();
-
-  // mutex_init(&event_mtx);
 
   INIT_LIST_HEAD(&event_log_list);
 
