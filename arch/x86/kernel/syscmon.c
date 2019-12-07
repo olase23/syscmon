@@ -68,10 +68,9 @@ static unsigned long checksum = 0;
 extern const unsigned long sys_call_table[SYS_CALL_TABLE_SIZE];
 extern void print_modules(void);
 
-extern void system_call(void);
-extern void ia32_syscall(void);
-extern void ia32_cstar_target(void);
-extern void ia32_sysenter_target(void);
+extern void entry_SYSCALL_64(void);
+extern void entry_SYSCALL_compat(void);
+extern void entry_SYSENTER_compat(void);
 
 void init_shadow_table(void);
 static int scm_proc_open(struct inode *, struct file *);
@@ -108,29 +107,29 @@ static void scm_init_entry_mode(void) {
   if (boot_cpu_has(X86_FEATURE_SYSCALL32)) {
     ia32_syscall_func = native_read_msr(MSR_CSTAR);
     if (ia32_syscall_func) {
-      if (ia32_syscall_func != (unsigned long long)ia32_cstar_target)
+      if (ia32_syscall_func != (unsigned long long)entry_SYSCALL_compat)
         printk(KERN_WARNING "syscmon: current IA32e SYSCALL entry differs from "
                             "proper entry point: %llx - %llx\n",
-               ia32_syscall_func, (unsigned long long)ia32_cstar_target);
+               ia32_syscall_func, (unsigned long long)entry_SYSCALL_compat);
     }
 
     ia32_sysenter_func = native_read_msr(MSR_IA32_SYSENTER_EIP);
     if (ia32_sysenter_func) {
-      if (ia32_sysenter_func != (unsigned long long)ia32_sysenter_target)
+      if (ia32_sysenter_func != (unsigned long long)entry_SYSENTER_compat)
         printk(KERN_WARNING
                "syscmon: current IA32e SYSENTER entry differs from "
                "proper entry point: %llx - %llx\n",
-               ia32_sysenter_func, (unsigned long long)ia32_sysenter_target);
+               ia32_sysenter_func, (unsigned long long)entry_SYSENTER_compat);
     }
   }
 
   if (boot_cpu_has(X86_FEATURE_SEP)) {
     syscall_func = native_read_msr(MSR_LSTAR);
     if (syscall_func) {
-      if (syscall_func != (unsigned long long)system_call)
+      if (syscall_func != (unsigned long long)entry_SYSCALL_64)
         printk(KERN_WARNING "syscmon: current SYSCALL entry differs from "
                             "proper entry point: %llx - %llx\n",
-               syscall_func, (unsigned long long)system_call);
+               syscall_func, (unsigned long long)entry_SYSCALL_64);
     }
   }
 
@@ -234,7 +233,7 @@ static unsigned long get_idt_entry(unsigned int vector) {
   gate_desc idt_entry;
   unsigned long gate_base;
 
-  native_store_idt(&dt);
+  store_idt(&dt);
 
   scm_read_idt_entry(&idt_entry, vector, (unsigned long *)dt.address, dt.size);
 
@@ -250,7 +249,7 @@ static unsigned long get_idt_entry(unsigned int vector) {
 static void scm_init_dt_checksums(void) {
   struct desc_ptr dt;
 
-  native_store_idt(&dt);
+  store_idt(&dt);
 
   scm_idt_checksum = scm_checksum((void *)dt.address, (dt.size * sizeof(long)));
 
